@@ -132,12 +132,18 @@ fn main() -> anyhow::Result<()> {
 
     let args = Args::parse();
     let repo = gix::open(&args.path)?;
+
+    let mut authors = Vec::new();
+
     for (author, times) in get_commit_times_by_author(&args, &repo)? {
-        println!(
-            "{author}: {} commits, {} hours",
-            times.len(),
-            estimate_hours(&args, &times)
-        );
+        authors.push((author, times.len(), estimate_hours(&args, &times)));
+    }
+
+    // TODO: make sort configurable (by commits or time)
+    authors.sort_by_key(|(_, _, time)| *time);
+
+    for (author, commits, time) in authors {
+        println!("{author}: {} commits, {} hours", commits, time);
     }
 
     Ok(())
