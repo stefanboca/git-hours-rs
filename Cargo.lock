@@ -391,7 +391,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "git-hours-rs"
+name = "git-hours"
 version = "0.1.0"
 dependencies = [
  "anyhow",
