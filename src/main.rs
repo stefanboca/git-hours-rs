@@ -26,6 +26,8 @@ struct Args {
     // /// Include commits until
     // #[arg(short, long)]
     // until:,
+
+    // TODO: consider making flag instead of value
     /// Include merge commits (commits with more than one parent)
     #[arg(short, long, default_value_t = true)]
     merge_commits: bool,
@@ -34,10 +36,9 @@ struct Args {
     #[arg(short, long, default_value = ".")]
     path: PathBuf,
 
-    /// Aliases of emails for grouping the same activity as one person
+    // Aliases of emails for grouping the same activity as one person
     // #[arg(short, long)]
     // email_aliases: HashMap<String, String>,
-
     /// Git branch
     #[arg(short, long)]
     branch: Option<String>,
@@ -83,8 +84,8 @@ fn get_commit_times_by_author(
                 if !is_merge || args.merge_commits {
                     // TODO:
                     // - filter by since/until
-                    // - consider using name instead of email (or both?)
-                    // - email(/name) aliases
+                    // - consider using name instead of email (or both?) (or configurable?)
+                    // - email/name aliases
                     if let Some(times) = times_by_author.get_mut(author.email) {
                         times.push(time);
                     } else {
