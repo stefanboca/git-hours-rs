@@ -125,13 +125,14 @@ fn estimate_hours(args: &Args, times: &[gix::date::Time]) -> u32 {
 }
 
 fn main() -> anyhow::Result<()> {
-    if std::fs::exists(".git/shallow")? {
+    let args = Args::parse();
+    if args.path.join(Path::new(".git/shallow")).try_exists()? {
         bail!(
-            "Cannot analyze shallow copies. Please run `git fetch --unshallow` before continuing."
+            "Cannot analyze shallow copies. Please run `git fetch --unshallow {:?}` before continuing.",
+            args.path
         );
     }
 
-    let args = Args::parse();
     let repo = gix::open(&args.path)?;
 
     let mut authors = Vec::new();
