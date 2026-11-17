@@ -1,96 +1,132 @@
+mod time;
+
+use ahash::{AHashMap, AHashSet};
 use std::{
-    collections::{HashMap, HashSet},
-    path::PathBuf,
+    ops::{Bound, RangeBounds},
+    path::{Path, PathBuf},
+    time::Duration,
 };
 
-use anyhow::bail;
+use anyhow::{Context, bail};
 use clap::Parser;
 use gix::bstr::BString;
+use jiff::{Span, Unit, Zoned};
 
-/// Estimate hours of a project
+use crate::time::CommitTimeBound;
+
+/// Estimate time spent on a project from its Git commits
 #[derive(Debug, Parser, Clone)]
-#[command(version, long_about = None)]
+#[command(version)]
 struct Args {
-    /// Maximum time difference between two subsequent commits in minutes which are counted to be
-    /// in the same coding session
-    #[arg(short = 'd', long, default_value_t = 2 * 60)]
-    max_commit_diff: u32,
+    /// Start a new session when the gap between commits reaches this duration (e.g. "2h" or "PT2H")
+    #[arg(short = 'd', long, value_name = "DURATION", default_value = "2h", value_parser = time::parse_unsigned_duration)]
+    max_commit_diff: Duration,
 
-    /// How many minutes should be added for the first commit of each coding session
-    #[arg(short, long, default_value_t = 2 * 60)]
-    first_commit_add: u32,
+    /// Time credited for the first commit of each session (at most --max-commit-diff)
+    #[arg(short, long, value_name = "DURATION", default_value = "2h", value_parser = time::parse_unsigned_duration)]
+    first_commit_add: Duration,
 
-    // /// Include commits since
-    // #[arg(short, long)]
-    // since:,
-    // /// Include commits until
-    // #[arg(short, long)]
-    // until:,
+    /// Include commits with an author time at or after this bound (e.g. `4 days ago` or `2026-11-13T00:00:00[UTC]`)
+    #[arg(long, value_name = "TIME", value_parser = CommitTimeBound::parse)]
+    since: Option<CommitTimeBound>,
+
+    /// Include commits with an author time at or before this bound (e.g. `1 day ago` or `2026-11-17T00:00:00[UTC]`)
+    #[arg(long, value_name = "TIME", value_parser = CommitTimeBound::parse)]
+    until: Option<CommitTimeBound>,
 
     // TODO: consider making flag instead of value
-    /// Include merge commits (commits with more than one parent)
+    /// Include merge commits (enabled by default)
     #[arg(short, long, default_value_t = true)]
     merge_commits: bool,
 
-    /// Git repository
+    /// Path to the Git repository
     #[arg(short, long, default_value = ".")]
     path: PathBuf,
 
     // Aliases of emails for grouping the same activity as one person
     // #[arg(short, long)]
     // email_aliases: HashMap<String, String>,
-    /// Git branch
+    /// Local branch name or prefix (all local branches by default)
     #[arg(short, long)]
     branch: Option<String>,
 }
 
-fn get_commit_times_by_author(
-    args: &Args,
-    repo: &gix::Repository,
-) -> anyhow::Result<HashMap<BString, Vec<gix::date::Time>>> {
+impl Args {
+    fn commit_time_range(&self) -> anyhow::Result<(Bound<Zoned>, Bound<Zoned>)> {
+        if self.since.is_none() && self.until.is_none() {
+            return Ok((Bound::Unbounded, Bound::Unbounded));
+        }
+
+        let now = Zoned::now();
+        let since = self
+            .since
+            .as_ref()
+            .map(|bound| bound.resolve(&now))
+            .transpose()
+            .context("could not resolve --since")?;
+        let until = self
+            .until
+            .as_ref()
+            .map(|bound| bound.resolve(&now))
+            .transpose()
+            .context("could not resolve --until")?;
+        if let (Some(since), Some(until)) = (&since, &until)
+            && since > until
+        {
+            bail!("--since must be at or before --until");
+        }
+
+        Ok((
+            since.map_or(Bound::Unbounded, Bound::Included),
+            until.map_or(Bound::Unbounded, Bound::Included),
+        ))
+    }
+}
+
+fn get_commit_times_by_author(args: &Args) -> anyhow::Result<AHashMap<BString, Vec<Zoned>>> {
+    let repo = gix::open(&args.path)?;
+    let time_range = args.commit_time_range()?;
     let refs = repo.references()?;
-    let prefix = if let Some(branch) = &args.branch {
-        format!("refs/heads/{branch}")
-    } else {
-        "refs/heads/".to_string()
-    };
+    let prefix = format!("refs/heads/{}", args.branch.as_deref().unwrap_or(""));
     let heads = refs.prefixed(prefix.as_str())?;
 
-    let mut visited = HashSet::new();
-    let mut times_by_author: HashMap<BString, Vec<gix::date::Time>> = HashMap::new();
+    let mut visited = AHashSet::new();
+    let mut times_by_author: AHashMap<BString, Vec<Zoned>> = AHashMap::new();
+    let mut stack = Vec::new();
     for head in heads.filter_map(|h| h.ok()) {
-        let mut stack = vec![head.id()];
+        stack.clear();
+        stack.push(head.id());
         while let Some(id) = stack.pop() {
-            let Ok(commit) = repo.find_commit(id) else {
-                continue;
-            };
-
-            if visited.contains(&commit.id) {
+            if visited.contains(&id.detach()) {
                 // This commit and its parents have already been visited. Any further work is
                 // redundant.
                 continue;
             }
+            let Ok(commit) = repo.find_commit(id) else {
+                continue;
+            };
             visited.insert(commit.id);
 
-            let stack_len = stack.len();
-            // extend the stack directly to avoid allocating a temporary vec for the parents.
-            stack.extend(commit.parent_ids());
-            let num_parents = stack.len() - stack_len;
+            let is_merge = {
+                let len = stack.len();
+                // extend the stack directly to avoid allocating a temporary vec for the parents.
+                stack.extend(commit.parent_ids());
+                stack.len() - len > 1
+            };
+            if is_merge && !args.merge_commits {
+                continue;
+            }
 
-            if let Ok(author) = commit.author()
-                && let Ok(time) = author.time()
-            {
-                let is_merge = num_parents > 1;
-                if !is_merge || args.merge_commits {
-                    // TODO:
-                    // - filter by since/until
-                    // - consider using name instead of email (or both?) (or configurable?)
-                    // - email/name aliases
-                    if let Some(times) = times_by_author.get_mut(author.email) {
-                        times.push(time);
-                    } else {
-                        times_by_author.insert(author.email.into(), vec![time]);
-                    }
+            let author = commit.author()?;
+            let time = author.time()?.to_zoned()?;
+            if time_range.contains(&time) {
+                // TODO:
+                // - consider using name instead of email (or both?) (or configurable?)
+                // - email/name aliases
+                if let Some(times) = times_by_author.get_mut(author.email) {
+                    times.push(time);
+                } else {
+                    times_by_author.insert(author.email.into(), vec![time]);
                 }
             }
         }
@@ -103,49 +139,55 @@ fn get_commit_times_by_author(
     Ok(times_by_author)
 }
 
-fn estimate_hours(args: &Args, times: &[gix::date::Time]) -> u32 {
-    if times.len() < 2 {
-        return 0;
+fn estimate_duration(args: &Args, times: &[Zoned]) -> Duration {
+    if times.is_empty() {
+        return Duration::ZERO;
     }
 
-    let mut hours = 10f64;
-
+    let mut total = args.first_commit_add;
     for window in times.windows(2) {
-        let (time, next_time) = (window[0], window[1]);
-        let diff_in_minutes = (next_time.seconds - time.seconds) as f64 / 60.0;
-
-        if diff_in_minutes < args.max_commit_diff as f64 {
-            hours += diff_in_minutes / 60.0;
+        let gap = window[1].duration_since(&window[0]).unsigned_abs();
+        let session_time = if gap < args.max_commit_diff {
+            gap
         } else {
-            hours += args.first_commit_add as f64 / 60.0;
-        }
+            args.first_commit_add
+        };
+        total = total.saturating_add(session_time);
     }
-
-    hours.round() as u32
+    total
 }
 
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
+    if args.first_commit_add > args.max_commit_diff {
+        bail!("--first-commit-add must be at most --max-commit-diff");
+    }
     if args.path.join(Path::new(".git/shallow")).try_exists()? {
         bail!(
-            "Cannot analyze shallow copies. Please run `git fetch --unshallow {:?}` before continuing.",
+            "cannot analyze shallow repository at {:?}. Run `git fetch --unshallow` from the repository and try again",
             args.path
         );
     }
 
-    let repo = gix::open(&args.path)?;
-
     let mut authors = Vec::new();
-
-    for (author, times) in get_commit_times_by_author(&args, &repo)? {
-        authors.push((author, times.len(), estimate_hours(&args, &times)));
+    for (author, times) in get_commit_times_by_author(&args)? {
+        authors.push((author, times.len(), estimate_duration(&args, &times)));
     }
 
     // TODO: make sort configurable (by commits or time)
-    authors.sort_by_key(|(_, _, time)| *time);
+    authors.sort_by_key(|(_, _, duration)| *duration);
 
-    for (author, commits, time) in authors {
-        println!("{author}: {} commits, {} hours", commits, time);
+    let round = jiff::SpanRound::new()
+        .smallest(Unit::Minute)
+        .increment(5)
+        .largest(Unit::Day)
+        .days_are_24_hours()
+        .mode(jiff::RoundMode::Ceil);
+    for (author, commits, duration) in authors {
+        println!(
+            "{author}: {commits} commits, {:#}",
+            Span::try_from(duration)?.round(round)?
+        );
     }
 
     Ok(())
